@@ -49,34 +49,14 @@ install_hysteria() {
   fi
 }
 
-uninstall_hysteria() {
-  systemctl stop $SERVICE_NAME 2>/dev/null
-  systemctl disable $SERVICE_NAME 2>/dev/null
-  rm -f "$BIN_PATH" "$YAML_CONFIG" "$JSON_CONFIG" "$QRCODE_IMG"
-  green "已卸载 Hysteria 客户端与配置文件"
-}
-
-# ========= 生成客户端配置 =========
+# ========= 自动生成客户端配置 =========
 gen_config() {
-  read -rp "请输入服务端地址（如 1.2.3.4 或 [IPv6]）: " server
-  read -rp "请输入端口（默认随机 20000-50000）: " port
-  [[ -z "$port" ]] && port=$((20000 + RANDOM % 30000))
-  read -rp "请输入连接密码（留空则自动生成）: " password
-  [[ -z "$password" ]] && password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
-  read -rp "请输入伪装 SNI 域名（默认 www.bing.com）: " sni
-  [[ -z "$sni" ]] && sni="www.bing.com"
-
-  echo "请选择证书验证方式："
-  echo "1) 跳过验证（默认）"
-  echo "2) 自定义证书路径"
-  read -rp "选择 [1-2]: " cert_mode
-
+  mkdir -p "$CONFIG_DIR"
+  server=$(curl -s6 ifconfig.io || curl -s ifconfig.me)
+  port=$((20000 + RANDOM % 20000))
+  password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
+  sni="www.bing.com"
   insecure=true
-  if [[ "$cert_mode" == "2" ]]; then
-    insecure=false
-    read -rp "请输入 cert 证书路径: " cert_path
-    read -rp "请输入 key 私钥路径: " key_path
-  fi
 
   cat > "$YAML_CONFIG" <<EOF
 server: "$server:$port"
@@ -122,23 +102,19 @@ EOF
 }
 EOF
 
-  url="hysteria2://$password@$server:$port/?sni=$sni"
-  [[ "$insecure" == true ]] && url+="&insecure=1"
+  url="hysteria2://$password@$server:$port/?sni=$sni&insecure=1"
   echo "$url" > "$CONFIG_DIR/url.txt"
   qrencode -o "$QRCODE_IMG" "$url"
-  green "配置生成完成！节点链接："
-  echo "$url"
-  echo "二维码已保存到 $QRCODE_IMG"
 }
 
-# ========= 运行客户端 =========
+# ========= 启动客户端 =========
 run_client() {
   nohup "$BIN_PATH" client -c "$YAML_CONFIG" > "$CONFIG_DIR/client.log" 2>&1 &
   sleep 1
   green "Hysteria 客户端已启动。日志：$CONFIG_DIR/client.log"
 }
 
-# ========= systemd 开机启动 =========
+# ========= 设置开机启动 =========
 setup_autostart() {
   cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
 [Unit]
@@ -158,73 +134,20 @@ EOF
   green "已添加为开机自启服务：$SERVICE_NAME"
 }
 
-# ========= 生成服务端配置 =========
-install_server() {
-  mkdir -p /etc/hysteria
-  read -rp "请输入监听端口（默认 39228）: " port
-  [[ -z "$port" ]] && port=39228
-  read -rp "请输入连接密码（auth，默认随机生成）: " password
-  [[ -z "$password" ]] && password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
-
-  echo "证书申请方式："
-  echo "1. 默认自签证书（跳过验证）"
-  echo "2. 使用 acme 自动申请（需域名和80/443可用）"
-  echo "3. 自定义证书路径"
-  read -rp "请选择 [1-3]: " cert_mode
-
-  cert_section=""
-  if [[ "$cert_mode" == "1" ]]; then
-    cert_section="tls:\n  alpn:\n    - h3\n  insecure: true"
-  elif [[ "$cert_mode" == "2" ]]; then
-    read -rp "请输入绑定的域名（需解析到本机）: " domain
-    curl https://get.acme.sh | sh
-    ~/.acme.sh/acme.sh --issue -d "$domain" --standalone
-    ~/.acme.sh/acme.sh --install-cert -d "$domain" \
-      --key-file /etc/hysteria/private.key \
-      --fullchain-file /etc/hysteria/cert.crt
-    cert_section="tls:\n  cert: /etc/hysteria/cert.crt\n  key: /etc/hysteria/private.key\n  alpn:\n    - h3"
-  elif [[ "$cert_mode" == "3" ]]; then
-    read -rp "请输入 cert 路径: " cert
-    read -rp "请输入 key 路径: " key
-    cert_section="tls:\n  cert: $cert\n  key: $key\n  alpn:\n    - h3"
-  fi
-
-  cat > "$SERVER_CONFIG" <<EOF
-listen: :$port
-auth:
-  type: password
-  password: $password
-$cert_section
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.bing.com
-    rewriteHost: true
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-EOF
-
-  cat > /etc/systemd/system/$SERVER_SERVICE.service <<EOF
-[Unit]
-Description=Hysteria 2 Server
-After=network.target
-
-[Service]
-ExecStart=$BIN_PATH server -c $SERVER_CONFIG
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reexec
-  systemctl enable --now $SERVER_SERVICE
-  green "✅ Hysteria 2 服务端已部署并运行"
-  echo "🔑 节点密码: $password"
-  echo "🌐 端口: $port"
+# ========= 一键全自动客户端搭建 =========
+full_auto_setup() {
+  check_ipv6_only
+  install_hysteria
+  gen_config
+  run_client
+  setup_autostart
+  green "✅ 全部完成，代理已运行！"
+  echo "🌐 出口检测："
+  curl --socks5 127.0.0.1:5678 https://ip.gs
+  echo "📷 二维码已保存：$QRCODE_IMG"
+  echo "🔗 节点链接："
+  cat "$CONFIG_DIR/url.txt"
+  exit 0
 }
 
 # ========= 主菜单 =========
@@ -233,7 +156,7 @@ show_menu() {
   echo "########################################"
   echo -e "#   \033[36mHysteria 2 一键终极管理脚本\033[0m   #"
   echo "########################################"
-  echo "1. 安装 Hysteria 客户端"
+  echo "1. 一键搭建客户端（全自动）"
   echo "2. 卸载 客户端"
   echo "3. 生成客户端配置"
   echo "4. 启动客户端"
@@ -247,7 +170,7 @@ show_menu() {
   read -rp "请选择操作 [0-8]: " opt
 
   case $opt in
-    1) install_hysteria && sleep 1;;
+    1) full_auto_setup;;
     2) uninstall_hysteria && sleep 1;;
     3) gen_config && sleep 1;;
     4) run_client && sleep 1;;
@@ -262,5 +185,4 @@ show_menu() {
   show_menu
 }
 
-check_ipv6_only
 show_menu

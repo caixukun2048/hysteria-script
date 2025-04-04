@@ -22,8 +22,11 @@ check_ipv6_only() {
   if curl -s --max-time 3 -4 https://ip.gs >/dev/null; then
     echo "有 IPv4"
   else
-    echo "无 IPv4，准备安装 WARP..."
-    install_warp
+    echo "无 IPv4 检测到。是否安装 WARP？"
+    echo "1. 不安装 (默认)"
+    echo "2. 安装 WARP"
+    read -rp "请选择 [1-2]: " warp_choice
+    [[ "$warp_choice" == "2" ]] && install_warp
   fi
 }
 
@@ -49,13 +52,83 @@ install_hysteria() {
   fi
 }
 
+# ========= 自动生成并启动服务端配置 =========
+install_server_auto() {
+  mkdir -p /etc/hysteria
+
+  echo "请选择服务端监听端口方式："
+  echo "1. 默认随机端口"
+  echo "2. 自定义端口"
+  read -rp "请输入选项 [1-2]（默认1）: " port_mode
+  if [[ "$port_mode" == "2" ]]; then
+    read -rp "请输入自定义端口（如 39228）: " port
+  else
+    port=$((20000 + RANDOM % 20000))
+  fi
+
+  echo "是否自定义连接密码？"
+  echo "1. 随机生成（默认）"
+  echo "2. 手动输入密码"
+  read -rp "请选择 [1-2]: " pw_mode
+  if [[ "$pw_mode" == "2" ]]; then
+    read -rp "请输入密码: " password
+  else
+    password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
+  fi
+
+  echo "请输入伪装域名（默认 www.bing.com）:"
+  read -rp "域名: " sni
+  [[ -z "$sni" ]] && sni="www.bing.com"
+
+  cat > "$SERVER_CONFIG" <<EOF
+listen: ":$port"
+auth:
+  type: password
+  password: $password
+tls:
+  alpn:
+    - h3
+  insecure: true
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$sni
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+EOF
+
+  cat > /etc/systemd/system/$SERVER_SERVICE.service <<EOF
+[Unit]
+Description=Hysteria 2 Server
+After=network.target
+
+[Service]
+ExecStart=$BIN_PATH server -c $SERVER_CONFIG
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reexec
+  systemctl enable --now $SERVER_SERVICE
+  green "服务端已启动，监听端口: $port"
+  echo "$port" > "$CONFIG_DIR/port.txt"
+  echo "$password" > "$CONFIG_DIR/password.txt"
+  echo "$sni" > "$CONFIG_DIR/sni.txt"
+}
+
 # ========= 自动生成客户端配置 =========
 gen_config() {
   mkdir -p "$CONFIG_DIR"
   server=$(curl -s6 ifconfig.io || curl -s ifconfig.me)
-  port=$((20000 + RANDOM % 20000))
-  password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
-  sni="www.bing.com"
+  port=$(cat "$CONFIG_DIR/port.txt")
+  password=$(cat "$CONFIG_DIR/password.txt")
+  sni=$(cat "$CONFIG_DIR/sni.txt")
   insecure=true
 
   cat > "$YAML_CONFIG" <<EOF
@@ -138,6 +211,7 @@ EOF
 full_auto_setup() {
   check_ipv6_only
   install_hysteria
+  install_server_auto
   gen_config
   run_client
   setup_autostart
@@ -149,40 +223,3 @@ full_auto_setup() {
   cat "$CONFIG_DIR/url.txt"
   exit 0
 }
-
-# ========= 主菜单 =========
-show_menu() {
-  clear
-  echo "########################################"
-  echo -e "#   \033[36mHysteria 2 一键终极管理脚本\033[0m   #"
-  echo "########################################"
-  echo "1. 一键搭建客户端（全自动）"
-  echo "2. 卸载 客户端"
-  echo "3. 生成客户端配置"
-  echo "4. 启动客户端"
-  echo "5. 设置开机启动（客户端）"
-  echo "6. 显示节点链接与二维码"
-  echo "7. 检查代理是否连通"
-  echo "------------------------------"
-  echo "8. 安装并配置 Hysteria 服务端"
-  echo "0. 退出"
-  echo ""
-  read -rp "请选择操作 [0-8]: " opt
-
-  case $opt in
-    1) full_auto_setup;;
-    2) uninstall_hysteria && sleep 1;;
-    3) gen_config && sleep 1;;
-    4) run_client && sleep 1;;
-    5) setup_autostart && sleep 1;;
-    6) cat "$CONFIG_DIR/url.txt" && echo "" && ls "$QRCODE_IMG" && sleep 1;;
-    7) curl --socks5 127.0.0.1:5678 https://ip.gs && sleep 1;;
-    8) install_server && sleep 1;;
-    0) exit 0;;
-    *) red "无效选项！" && sleep 1;;
-  esac
-  read -n 1 -s -r -p "按任意键返回菜单..."
-  show_menu
-}
-
-show_menu

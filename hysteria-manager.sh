@@ -7,6 +7,8 @@ JSON_CONFIG="$CONFIG_DIR/hy-client.json"
 QRCODE_IMG="$CONFIG_DIR/hysteria-node.png"
 BIN_PATH="/usr/local/bin/hysteria"
 SERVICE_NAME="hysteria-client"
+SERVER_CONFIG="/etc/hysteria/config.yaml"
+SERVER_SERVICE="hysteria-server"
 
 # ========= 工具函数 =========
 green() { echo -e "\033[32m$1\033[0m"; }
@@ -34,7 +36,7 @@ install_warp() {
   bash <(curl -fsSL https://warp.deno.dev/auto) || red "WARP 安装失败！"
 }
 
-# ========= 安装 Hysteria 2 =========
+# ========= 安装 Hysteria =========
 install_hysteria() {
   mkdir -p "$CONFIG_DIR"
   if [[ ! -f "$BIN_PATH" ]]; then
@@ -47,7 +49,6 @@ install_hysteria() {
   fi
 }
 
-# ========= 卸载 Hysteria =========
 uninstall_hysteria() {
   systemctl stop $SERVICE_NAME 2>/dev/null
   systemctl disable $SERVICE_NAME 2>/dev/null
@@ -55,7 +56,7 @@ uninstall_hysteria() {
   green "已卸载 Hysteria 客户端与配置文件"
 }
 
-# ========= 生成配置 =========
+# ========= 生成客户端配置 =========
 gen_config() {
   read -rp "请输入服务端地址（如 1.2.3.4 或 [IPv6]）: " server
   read -rp "请输入端口（默认随机 20000-50000）: " port
@@ -71,16 +72,12 @@ gen_config() {
   read -rp "选择 [1-2]: " cert_mode
 
   insecure=true
-  cert_path=""
-  key_path=""
-
   if [[ "$cert_mode" == "2" ]]; then
     insecure=false
     read -rp "请输入 cert 证书路径: " cert_path
     read -rp "请输入 key 私钥路径: " key_path
   fi
 
-  # 写入 YAML 配置
   cat > "$YAML_CONFIG" <<EOF
 server: "$server:$port"
 auth: $password
@@ -100,7 +97,6 @@ transport:
     hopInterval: 30s
 EOF
 
-  # JSON 配置
   cat > "$JSON_CONFIG" <<EOF
 {
   "server": "$server:$port",
@@ -126,12 +122,9 @@ EOF
 }
 EOF
 
-  # 生成分享链接
   url="hysteria2://$password@$server:$port/?sni=$sni"
   [[ "$insecure" == true ]] && url+="&insecure=1"
   echo "$url" > "$CONFIG_DIR/url.txt"
-
-  # 生成二维码
   qrencode -o "$QRCODE_IMG" "$url"
   green "配置生成完成！节点链接："
   echo "$url"
@@ -145,7 +138,7 @@ run_client() {
   green "Hysteria 客户端已启动。日志：$CONFIG_DIR/client.log"
 }
 
-# ========= 创建 Systemd =========
+# ========= systemd 开机启动 =========
 setup_autostart() {
   cat > /etc/systemd/system/$SERVICE_NAME.service <<EOF
 [Unit]
@@ -165,22 +158,93 @@ EOF
   green "已添加为开机自启服务：$SERVICE_NAME"
 }
 
+# ========= 生成服务端配置 =========
+install_server() {
+  mkdir -p /etc/hysteria
+  read -rp "请输入监听端口（默认 39228）: " port
+  [[ -z "$port" ]] && port=39228
+  read -rp "请输入连接密码（auth，默认随机生成）: " password
+  [[ -z "$password" ]] && password=$(head -c 6 /dev/urandom | md5sum | cut -c1-8)
+
+  echo "证书申请方式："
+  echo "1. 默认自签证书（跳过验证）"
+  echo "2. 使用 acme 自动申请（需域名和80/443可用）"
+  echo "3. 自定义证书路径"
+  read -rp "请选择 [1-3]: " cert_mode
+
+  cert_section=""
+  if [[ "$cert_mode" == "1" ]]; then
+    cert_section="tls:\n  alpn:\n    - h3\n  insecure: true"
+  elif [[ "$cert_mode" == "2" ]]; then
+    read -rp "请输入绑定的域名（需解析到本机）: " domain
+    curl https://get.acme.sh | sh
+    ~/.acme.sh/acme.sh --issue -d "$domain" --standalone
+    ~/.acme.sh/acme.sh --install-cert -d "$domain" \
+      --key-file /etc/hysteria/private.key \
+      --fullchain-file /etc/hysteria/cert.crt
+    cert_section="tls:\n  cert: /etc/hysteria/cert.crt\n  key: /etc/hysteria/private.key\n  alpn:\n    - h3"
+  elif [[ "$cert_mode" == "3" ]]; then
+    read -rp "请输入 cert 路径: " cert
+    read -rp "请输入 key 路径: " key
+    cert_section="tls:\n  cert: $cert\n  key: $key\n  alpn:\n    - h3"
+  fi
+
+  cat > "$SERVER_CONFIG" <<EOF
+listen: :$port
+auth:
+  type: password
+  password: $password
+$cert_section
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+EOF
+
+  cat > /etc/systemd/system/$SERVER_SERVICE.service <<EOF
+[Unit]
+Description=Hysteria 2 Server
+After=network.target
+
+[Service]
+ExecStart=$BIN_PATH server -c $SERVER_CONFIG
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reexec
+  systemctl enable --now $SERVER_SERVICE
+  green "✅ Hysteria 2 服务端已部署并运行"
+  echo "🔑 节点密码: $password"
+  echo "🌐 端口: $port"
+}
+
 # ========= 主菜单 =========
 show_menu() {
   clear
   echo "########################################"
   echo -e "#   \033[36mHysteria 2 一键终极管理脚本\033[0m   #"
   echo "########################################"
-  echo "1. 安装 Hysteria 2"
-  echo "2. 卸载 Hysteria 2"
-  echo "3. 创建/更新配置文件"
+  echo "1. 安装 Hysteria 客户端"
+  echo "2. 卸载 客户端"
+  echo "3. 生成客户端配置"
   echo "4. 启动客户端"
-  echo "5. 设置开机自启"
+  echo "5. 设置开机启动（客户端）"
   echo "6. 显示节点链接与二维码"
   echo "7. 检查代理是否连通"
+  echo "------------------------------"
+  echo "8. 安装并配置 Hysteria 服务端"
   echo "0. 退出"
   echo ""
-  read -rp "请选择操作 [0-7]: " opt
+  read -rp "请选择操作 [0-8]: " opt
 
   case $opt in
     1) install_hysteria && sleep 1;;
@@ -190,6 +254,7 @@ show_menu() {
     5) setup_autostart && sleep 1;;
     6) cat "$CONFIG_DIR/url.txt" && echo "" && ls "$QRCODE_IMG" && sleep 1;;
     7) curl --socks5 127.0.0.1:5678 https://ip.gs && sleep 1;;
+    8) install_server && sleep 1;;
     0) exit 0;;
     *) red "无效选项！" && sleep 1;;
   esac

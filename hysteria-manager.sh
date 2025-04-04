@@ -223,3 +223,6 @@ full_auto_setup() {
   cat "$CONFIG_DIR/url.txt"
   exit 0
 }
+
+# ========= 启动入口 =========
+full_auto_setup
